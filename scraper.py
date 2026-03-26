@@ -136,7 +136,9 @@ async def get_programme_links(page: Page) -> list[str]:
             seen.add(clean)
             unique.append(clean)
 
-    log.info("Found %d programme links", len(unique))
+    # Keep only bachelor-level programmes
+    unique = [u for u in unique if "bachelor" in u.lower()]
+    log.info("Found %d bachelor programme links", len(unique))
     return unique
 
 
@@ -446,17 +448,20 @@ async def scrape_programme(page: Page, url: str) -> Optional[Programme]:
 # CSV output
 # ---------------------------------------------------------------------------
 
-def save_csv(programmes: list[Programme], path: str = OUTPUT_CSV) -> None:
-    if not programmes:
-        log.warning("No programmes to save.")
-        return
-    fieldnames = list(asdict(programmes[0]).keys())
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for p in programmes:
-            writer.writerow(asdict(p))
-    log.info("Saved %d programmes to %s", len(programmes), path)
+def open_csv_writer(path: str = OUTPUT_CSV):
+    """Open the CSV file, write the header, and return (file, writer)."""
+    fieldnames = list(asdict(Programme()).keys())
+    f = open(path, "w", newline="", encoding="utf-8")
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    f.flush()
+    return f, writer
+
+
+def append_csv_row(writer, f, prog: Programme) -> None:
+    """Write a single programme row and flush immediately."""
+    writer.writerow(asdict(prog))
+    f.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -464,64 +469,70 @@ def save_csv(programmes: list[Programme], path: str = OUTPUT_CSV) -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    programmes: list[Programme] = []
+    count = 0
+    csv_file, csv_writer = open_csv_writer(OUTPUT_CSV)
+    log.info("Opened %s for incremental writing", OUTPUT_CSV)
 
-    async with async_playwright() as pw:
-        # Use pre-cached Chromium if the default version isn't downloaded
-        import os
-        chrome_path = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "")
-        if not chrome_path:
-            candidates = [
-                "/root/.cache/ms-playwright/chromium-1194/chrome-linux/chrome",
-                "/root/.cache/ms-playwright/chromium_headless_shell-1194/chrome-linux/chrome-headless-shell",
-            ]
-            for c in candidates:
-                if os.path.exists(c):
-                    chrome_path = c
-                    break
-        launch_kwargs = {"headless": True}
-        if chrome_path:
-            log.info("Using Chromium at: %s", chrome_path)
-            launch_kwargs["executable_path"] = chrome_path
-        browser = await pw.chromium.launch(**launch_kwargs)
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-            locale="en-NZ",
-            viewport={"width": 1280, "height": 900},
-        )
-        page = await context.new_page()
+    try:
+        async with async_playwright() as pw:
+            # Use pre-cached Chromium if the default version isn't downloaded
+            import os
+            chrome_path = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "")
+            if not chrome_path:
+                candidates = [
+                    "/root/.cache/ms-playwright/chromium-1194/chrome-linux/chrome",
+                    "/root/.cache/ms-playwright/chromium_headless_shell-1194/chrome-linux/chrome-headless-shell",
+                ]
+                for c in candidates:
+                    if os.path.exists(c):
+                        chrome_path = c
+                        break
+            launch_kwargs = {"headless": True}
+            if chrome_path:
+                log.info("Using Chromium at: %s", chrome_path)
+                launch_kwargs["executable_path"] = chrome_path
+            browser = await pw.chromium.launch(**launch_kwargs)
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+                locale="en-NZ",
+                viewport={"width": 1280, "height": 900},
+            )
+            page = await context.new_page()
 
-        # Step 1: collect all programme links
-        links = await get_programme_links(page)
+            # Step 1: collect all bachelor programme links
+            links = await get_programme_links(page)
 
-        if not links:
-            log.error("No programme links found — check the index page structure.")
+            if not links:
+                log.error("No programme links found — check the index page structure.")
+                await browser.close()
+                return
+
+            # Step 2: scrape each programme, writing to CSV immediately
+            for i, url in enumerate(links, 1):
+                log.info("[%d/%d] Scraping: %s", i, len(links), url)
+
+                prog = await scrape_programme(page, url)
+                if prog:
+                    append_csv_row(csv_writer, csv_file, prog)
+                    count += 1
+                    log.info(
+                        "    [saved %d] name=%r  duration=%r  points=%r  fees=%r",
+                        count, prog.full_name, prog.duration, prog.points, prog.domestic_fees,
+                    )
+
+                # Polite delay between pages
+                if i < len(links):
+                    await asyncio.sleep(PAGE_DELAY)
+
             await browser.close()
-            return
 
-        # Step 2: scrape each programme
-        for i, url in enumerate(links, 1):
-            log.info("[%d/%d] Scraping: %s", i, len(links), url)
+    finally:
+        csv_file.close()
 
-            prog = await scrape_programme(page, url)
-            if prog:
-                programmes.append(prog)
-                log.info(
-                    "    name=%r  duration=%r  points=%r  fees=%r",
-                    prog.full_name, prog.duration, prog.points, prog.domestic_fees,
-                )
-
-            # Polite delay between pages
-            if i < len(links):
-                await asyncio.sleep(PAGE_DELAY)
-
-        await browser.close()
-
-    save_csv(programmes, OUTPUT_CSV)
-    log.info("Done. %d programmes written to %s", len(programmes), OUTPUT_CSV)
+    log.info("Done. %d programmes written to %s", count, OUTPUT_CSV)
 
 
 if __name__ == "__main__":
