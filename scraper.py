@@ -467,7 +467,23 @@ async def main() -> None:
     programmes: list[Programme] = []
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+        # Use pre-cached Chromium if the default version isn't downloaded
+        import os
+        chrome_path = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "")
+        if not chrome_path:
+            candidates = [
+                "/root/.cache/ms-playwright/chromium-1194/chrome-linux/chrome",
+                "/root/.cache/ms-playwright/chromium_headless_shell-1194/chrome-linux/chrome-headless-shell",
+            ]
+            for c in candidates:
+                if os.path.exists(c):
+                    chrome_path = c
+                    break
+        launch_kwargs = {"headless": True}
+        if chrome_path:
+            log.info("Using Chromium at: %s", chrome_path)
+            launch_kwargs["executable_path"] = chrome_path
+        browser = await pw.chromium.launch(**launch_kwargs)
         context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
