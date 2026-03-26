@@ -31,7 +31,13 @@ STUDY_OPTIONS_URL = (
 )
 
 # Seconds to wait between navigating to each programme page
-PAGE_DELAY = 2
+PAGE_DELAY = 0.5
+
+# Max seconds to wait for a tab's content to load before retrying
+TAB_TIMEOUT = 10
+
+# How many times to retry a failed page or tab
+MAX_RETRIES = 3
 
 OUTPUT_CSV = "uoa_courses.csv"
 
@@ -63,7 +69,7 @@ def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-async def _safe_text(page: Page, selector: str, timeout: int = 5000) -> str:
+async def _safe_text(page: Page, selector: str, timeout: int = 3000) -> str:
     """Return inner text for the first matching element, or '' on failure."""
     try:
         el = await page.wait_for_selector(selector, timeout=timeout)
@@ -98,17 +104,17 @@ async def get_programme_links(page: Page) -> list[str]:
     The page uses JavaScript to render a filterable list of study options.
     """
     log.info("Loading study options index: %s", STUDY_OPTIONS_URL)
-    await page.goto(STUDY_OPTIONS_URL, wait_until="networkidle", timeout=60000)
+    await page.goto(STUDY_OPTIONS_URL, wait_until="domcontentloaded", timeout=10000)
 
     # Wait for some course links to appear
     try:
-        await page.wait_for_selector("a[href]", timeout=15000)
+        await page.wait_for_selector("a[href]", timeout=10000)
     except PlaywrightTimeout:
         log.warning("Timed out waiting for links on index page")
 
     # Scroll to bottom to trigger lazy-load
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    await asyncio.sleep(2)
+    await asyncio.sleep(1)
 
     # Collect all internal programme links
     # UoA study option URLs typically match:
@@ -276,7 +282,7 @@ async def _click_tab(page: Page, *label_patterns: str) -> bool:
                 el = await page.query_selector(sel)
                 if el:
                     await el.click()
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(0.5)
                     return True
         except Exception:
             continue
@@ -288,44 +294,50 @@ async def _click_tab(page: Page, *label_patterns: str) -> bool:
 # ---------------------------------------------------------------------------
 
 async def scrape_entry_requirements(page: Page, prog: Programme) -> None:
-    """Click the Entry Requirements tab and extract relevant fields."""
-    clicked = await _click_tab(
-        page,
-        "Entry requirements",
-        "Entry Requirements",
-        "Admission",
-        "Requirements",
-    )
-    if not clicked:
-        log.debug("No entry requirements tab found for %s", prog.full_name)
-        return
+    """Click the Entry Requirements tab and extract relevant fields, retrying up to MAX_RETRIES times."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            clicked = await _click_tab(
+                page,
+                "Entry requirements",
+                "Entry Requirements",
+                "Admission",
+                "Requirements",
+            )
+            if not clicked:
+                log.debug("No entry requirements tab found for %s", prog.full_name)
+                return
 
-    # Wait for content to load
-    await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
 
-    # Get the full text of the tab panel / page section
-    try:
-        panel_text: str = await page.evaluate(
-            """() => {
-                // Find the active/visible tab panel
-                const selectors = [
-                    '[role="tabpanel"]:not([hidden])',
-                    '.tab-content.active',
-                    '.tab-pane.active',
-                    '.entry-requirements',
-                    '[class*="entry-req"]',
-                    '[class*="requirements"]',
-                    'main',
-                ];
-                for (const sel of selectors) {
-                    const el = document.querySelector(sel);
-                    if (el) return el.innerText;
-                }
-                return document.body.innerText;
-            }"""
-        )
-    except Exception:
-        panel_text = ""
+            panel_text: str = await asyncio.wait_for(
+                page.evaluate(
+                    """() => {
+                        const selectors = [
+                            '[role="tabpanel"]:not([hidden])',
+                            '.tab-content.active',
+                            '.tab-pane.active',
+                            '.entry-requirements',
+                            '[class*="entry-req"]',
+                            '[class*="requirements"]',
+                            'main',
+                        ];
+                        for (const sel of selectors) {
+                            const el = document.querySelector(sel);
+                            if (el) return el.innerText;
+                        }
+                        return document.body.innerText;
+                    }"""
+                ),
+                timeout=TAB_TIMEOUT,
+            )
+            break  # success — exit retry loop
+        except (asyncio.TimeoutError, PlaywrightTimeout, Exception) as e:
+            if attempt < MAX_RETRIES:
+                log.warning("Entry requirements tab attempt %d/%d failed (%s), retrying…", attempt, MAX_RETRIES, e)
+            else:
+                log.warning("Entry requirements tab failed after %d attempts for %s", MAX_RETRIES, prog.full_name)
+                return
 
     panel_text = re.sub(r"\s+", " ", panel_text)
 
@@ -360,40 +372,49 @@ async def scrape_entry_requirements(page: Page, prog: Programme) -> None:
 # ---------------------------------------------------------------------------
 
 async def scrape_fees_scholarships(page: Page, prog: Programme) -> None:
-    """Click the Fees & Scholarships tab and extract fee and scholarship info."""
-    clicked = await _click_tab(
-        page,
-        "Fees and scholarships",
-        "Fees & Scholarships",
-        "Fees",
-        "Tuition",
-    )
-    if not clicked:
-        log.debug("No fees tab found for %s", prog.full_name)
-        return
+    """Click the Fees & Scholarships tab and extract fee and scholarship info, retrying up to MAX_RETRIES times."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            clicked = await _click_tab(
+                page,
+                "Fees and scholarships",
+                "Fees & Scholarships",
+                "Fees",
+                "Tuition",
+            )
+            if not clicked:
+                log.debug("No fees tab found for %s", prog.full_name)
+                return
 
-    await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
 
-    try:
-        panel_text: str = await page.evaluate(
-            """() => {
-                const selectors = [
-                    '[role="tabpanel"]:not([hidden])',
-                    '.tab-content.active',
-                    '.tab-pane.active',
-                    '[class*="fees"]',
-                    '[class*="scholarship"]',
-                    'main',
-                ];
-                for (const sel of selectors) {
-                    const el = document.querySelector(sel);
-                    if (el) return el.innerText;
-                }
-                return document.body.innerText;
-            }"""
-        )
-    except Exception:
-        panel_text = ""
+            panel_text: str = await asyncio.wait_for(
+                page.evaluate(
+                    """() => {
+                        const selectors = [
+                            '[role="tabpanel"]:not([hidden])',
+                            '.tab-content.active',
+                            '.tab-pane.active',
+                            '[class*="fees"]',
+                            '[class*="scholarship"]',
+                            'main',
+                        ];
+                        for (const sel of selectors) {
+                            const el = document.querySelector(sel);
+                            if (el) return el.innerText;
+                        }
+                        return document.body.innerText;
+                    }"""
+                ),
+                timeout=TAB_TIMEOUT,
+            )
+            break  # success — exit retry loop
+        except (asyncio.TimeoutError, PlaywrightTimeout, Exception) as e:
+            if attempt < MAX_RETRIES:
+                log.warning("Fees tab attempt %d/%d failed (%s), retrying…", attempt, MAX_RETRIES, e)
+            else:
+                log.warning("Fees tab failed after %d attempts for %s", MAX_RETRIES, prog.full_name)
+                return
 
     panel_text = re.sub(r"\s+", " ", panel_text)
 
@@ -422,26 +443,24 @@ async def scrape_fees_scholarships(page: Page, prog: Programme) -> None:
 # ---------------------------------------------------------------------------
 
 async def scrape_programme(page: Page, url: str) -> Optional[Programme]:
-    """Scrape a single programme page. Returns None on hard failure."""
-    prog = Programme(url=url)
-    try:
-        log.info("  -> %s", url)
-        await page.goto(url, wait_until="networkidle", timeout=60000)
+    """Scrape a single programme page, retrying up to MAX_RETRIES times on failure."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        prog = Programme(url=url)
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=10000)
+            await scrape_main_info(page, prog)
+            await scrape_entry_requirements(page, prog)
+            await scrape_fees_scholarships(page, prog)
+            return prog
+        except (PlaywrightTimeout, asyncio.TimeoutError) as e:
+            log.warning("Timeout on %s (attempt %d/%d)", url, attempt, MAX_RETRIES)
+        except Exception as e:
+            log.warning("Error on %s (attempt %d/%d): %s", url, attempt, MAX_RETRIES, e)
+        if attempt < MAX_RETRIES:
+            await asyncio.sleep(1)
 
-        await scrape_main_info(page, prog)
-        await scrape_entry_requirements(page, prog)
-        await scrape_fees_scholarships(page, prog)
-
-    except PlaywrightTimeout:
-        log.warning("Timeout loading %s", url)
-        if not prog.full_name:
-            return None
-    except Exception as e:
-        log.warning("Error scraping %s: %s", url, e)
-        if not prog.full_name:
-            return None
-
-    return prog
+    log.error("Giving up on %s after %d attempts", url, MAX_RETRIES)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +489,8 @@ def append_csv_row(writer, f, prog: Programme) -> None:
 
 async def main() -> None:
     count = 0
+    Path(OUTPUT_CSV).unlink(missing_ok=True)
+    log.info("Deleted existing %s (fresh run)", OUTPUT_CSV)
     csv_file, csv_writer = open_csv_writer(OUTPUT_CSV)
     log.info("Opened %s for incremental writing", OUTPUT_CSV)
 
