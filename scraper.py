@@ -69,13 +69,13 @@ def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-async def _safe_text(page: Page, selector: str, timeout: int = 3000) -> str:
-    """Return inner text for the first matching element, or '' on failure."""
+async def _safe_text(page: Page, selector: str) -> str:
+    """Return inner text for the first matching element, or '' — returns instantly."""
     try:
-        el = await page.wait_for_selector(selector, timeout=timeout)
+        el = await page.query_selector(selector)
         if el:
             return _clean(await el.inner_text())
-    except (PlaywrightTimeout, Exception):
+    except Exception:
         pass
     return ""
 
@@ -157,7 +157,7 @@ async def scrape_main_info(page: Page, prog: Programme) -> None:
 
     # --- Full name: usually in the main heading ---
     for sel in ["h1.page-header__title", "h1", ".programme-title", ".study-option-title"]:
-        text = await _safe_text(page, sel, timeout=5000)
+        text = await _safe_text(page, sel)
         if text:
             prog.full_name = text
             break
@@ -170,7 +170,7 @@ async def scrape_main_info(page: Page, prog: Programme) -> None:
         "[class*='abbreviation']",
         "[class*='short-name']",
     ]:
-        text = await _safe_text(page, sel, timeout=2000)
+        text = await _safe_text(page, sel)
         if text:
             prog.short_name = text
             break
@@ -253,7 +253,7 @@ async def scrape_main_info(page: Page, prog: Programme) -> None:
     ]:
         if getattr(prog, attr):
             continue
-        text = await _safe_text(page, sel, timeout=2000)
+        text = await _safe_text(page, sel)
         if text:
             setattr(prog, attr, text)
 
@@ -448,6 +448,8 @@ async def scrape_programme(page: Page, url: str) -> Optional[Programme]:
         prog = Programme(url=url)
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=10000)
+            # Wait once for the page body to be present before querying anything
+            await page.wait_for_selector("h1, main", timeout=10000)
             await scrape_main_info(page, prog)
             await scrape_entry_requirements(page, prog)
             await scrape_fees_scholarships(page, prog)
@@ -540,8 +542,8 @@ async def main() -> None:
                     append_csv_row(csv_writer, csv_file, prog)
                     count += 1
                     log.info(
-                        "    [saved %d] name=%r  duration=%r  points=%r  fees=%r",
-                        count, prog.full_name, prog.duration, prog.points, prog.domestic_fees,
+                        "    [saved %d] name=%r  duration=%r  points=%r  fees=%r  rank=%r",
+                        count, prog.full_name, prog.duration, prog.points, prog.domestic_fees, prog.ncea_rank_score,
                     )
 
                 # Polite delay between pages
