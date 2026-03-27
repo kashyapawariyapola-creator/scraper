@@ -2,11 +2,7 @@
 University of Auckland Undergraduate Programme Scraper (Playwright)
 
 Scrapes bachelor degree pages from the UoA study options listing.
-Collects: name, abbreviation, description, duration, points, faculty,
-          NCEA rank score, required subjects, additional requirements,
-          domestic fees, and scholarships.
-
-Output: uoa_courses.csv (written incrementally — crash-safe)
+Output: uoa_courses.csv  (written incrementally — crash-safe)
 """
 
 import asyncio
@@ -40,9 +36,19 @@ STUDY_OPTIONS_URL = (
 OUTPUT_CSV = "uoa_courses.csv"
 PAGE_DELAY = 0.5        # seconds between pages
 MAX_TIMEOUT = 8000      # ms — hard cap for every Playwright timeout
-TAB_WAIT = 1.5          # seconds to sleep after clicking a tab
-MAX_RETRIES = 3         # page-level retries
+TAB_WAIT = 1.5          # seconds to sleep after clicking a tab (then proceed regardless)
+MAX_RETRIES = 3         # page-level retries on error/timeout
 
+# Degree-subject keywords used to detect conjoint URLs (issue 6)
+_SUBJECTS = [
+    "arts", "commerce", "science", "engineering",
+    "design", "education", "music", "laws",
+]
+
+
+# ---------------------------------------------------------------------------
+# Data model  — points hardcoded to 360 (issue 4)
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Programme:
@@ -50,7 +56,7 @@ class Programme:
     short_name: str = ""
     description: str = ""
     duration: str = ""
-    points: str = ""
+    points: str = "360"     # all UoA undergrad degrees are 360 points
     faculty: str = ""
     ncea_rank_score: str = ""
     required_subjects: str = ""
@@ -61,16 +67,15 @@ class Programme:
 
 
 # ---------------------------------------------------------------------------
-# Tiny helpers
+# DOM helpers — all use query_selector (instant, no blocking)
 # ---------------------------------------------------------------------------
 
 def _clean(text: str) -> str:
-    """Collapse whitespace and strip."""
     return re.sub(r"\s+", " ", text or "").strip()
 
 
 async def _text(page: Page, selector: str) -> str:
-    """Instant query_selector — returns inner text or ''."""
+    """Return inner text of the first matching element, or ''."""
     try:
         el = await page.query_selector(selector)
         if el:
@@ -81,29 +86,48 @@ async def _text(page: Page, selector: str) -> str:
 
 
 async def _texts(page: Page, selector: str) -> list[str]:
-    """Return inner texts for *all* matching elements (instant)."""
+    """Return inner texts of all matching elements."""
     try:
         els = await page.query_selector_all(selector)
-        out = []
-        for el in els:
-            t = _clean(await el.inner_text())
-            if t:
-                out.append(t)
-        return out
+        return [_clean(await el.inner_text()) for el in els if await el.inner_text()]
     except Exception:
         return []
 
 
-async def _page_text(page: Page) -> str:
-    """Get the full visible text of the page body (instant JS call)."""
+async def _body_text(page: Page) -> str:
+    """Full visible body text — instant JS call."""
     try:
         return await page.evaluate("() => document.body.innerText")
     except Exception:
         return ""
 
 
+async def _tab_panel_text(page: Page) -> str:
+    """
+    Text of the currently active/visible tab panel only.
+    Falls back to body text if no panel can be identified.
+    Used so that keywords (e.g. UCAT) from *other* tabs don't bleed in.
+    """
+    try:
+        return await page.evaluate("""() => {
+            const candidates = [
+                '[role="tabpanel"]:not([hidden]):not([aria-hidden="true"])',
+                '.tab-content .tab-pane.active',
+                '.tab-content.active',
+                '[class*="tab"][class*="active"]',
+            ];
+            for (const sel of candidates) {
+                const el = document.querySelector(sel);
+                if (el && el.offsetParent !== null) return el.innerText;
+            }
+            return document.body.innerText;
+        }""")
+    except Exception:
+        return await _body_text(page)
+
+
 async def _click_tab(page: Page, *labels: str) -> bool:
-    """Click the first tab whose text matches any of *labels*. Instant."""
+    """Click the first tab element whose text matches any label. Instant."""
     for label in labels:
         for sel in [
             f"a:has-text('{label}')",
@@ -121,90 +145,159 @@ async def _click_tab(page: Page, *labels: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# URL filtering (issues 6 & 7)
+# ---------------------------------------------------------------------------
+
+def _should_skip_url(url: str) -> bool:
+    """
+    Return True for URLs that should be excluded:
+      - Conjoint / double-degree URLs (issue 6)
+      - Postgraduate honours extensions, keeping only engineering & laws (issue 7)
+    """
+    slug = url.lower().rstrip("/").split("/")[-1].replace(".html", "")
+
+    # Issue 6: conjoint / double-degree
+    if "conjoint" in slug:
+        return True
+    if slug.count("bachelor") > 1:
+        return True
+    if sum(1 for s in _SUBJECTS if s in slug) > 1:
+        return True
+
+    # Issue 7: postgrad honours — only keep engineering and laws honours
+    if "honours" in slug and "engineering" not in slug and "laws" not in slug:
+        return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
 # 1. Link discovery
 # ---------------------------------------------------------------------------
 
 async def get_programme_links(page: Page) -> list[str]:
-    """Load the study-options index and collect all bachelor programme URLs."""
+    """Load the study-options index and return filtered bachelor programme URLs."""
     log.info("Loading study options index …")
-    await page.goto(STUDY_OPTIONS_URL, wait_until="domcontentloaded",
-                    timeout=MAX_TIMEOUT)
+    await page.goto(STUDY_OPTIONS_URL, wait_until="domcontentloaded", timeout=MAX_TIMEOUT)
 
-    # One wait for the page to have some links rendered
     try:
         await page.wait_for_selector("a[href]", timeout=MAX_TIMEOUT)
     except PlaywrightTimeout:
         log.warning("Timed out waiting for links on index page")
 
-    # Scroll to trigger any lazy-load
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await asyncio.sleep(1)
 
-    all_links: list[str] = await page.evaluate("""() => {
-        return Array.from(document.querySelectorAll('a[href]'))
+    all_links: list[str] = await page.evaluate("""() =>
+        Array.from(document.querySelectorAll('a[href]'))
             .map(a => a.href)
             .filter(h =>
                 h.includes('/find-a-study-option/') &&
                 h.endsWith('.html') &&
                 !h.endsWith('find-a-study-option.html')
-            );
-    }""")
+            )
+    """)
 
-    # Deduplicate, keep only bachelor URLs
     seen: set[str] = set()
     unique: list[str] = []
     for link in all_links:
         clean = link.split("?")[0].split("#")[0]
-        if clean not in seen and "bachelor" in clean.lower():
+        if (
+            clean not in seen
+            and "bachelor" in clean.lower()
+            and not _should_skip_url(clean)
+        ):
             seen.add(clean)
             unique.append(clean)
 
-    log.info("Found %d bachelor programme links", len(unique))
+    log.info("Found %d bachelor programme links (after filtering)", len(unique))
     return unique
 
 
 # ---------------------------------------------------------------------------
-# 2. Main page scraping  (instant — no waits)
+# 2. Main page scraping
 # ---------------------------------------------------------------------------
 
+def _parse_name_and_abbreviation(heading: str) -> tuple[str, str]:
+    """
+    Split the h1 heading into (full_name, short_name).
+
+    Handles patterns like:
+      "Bachelor of Arts BA"              → ("Bachelor of Arts", "BA")
+      "Bachelor of Science BSc"          → ("Bachelor of Science", "BSc")
+      "Bachelor of Engineering (Honours) BE(Hons)"
+                                         → ("Bachelor of Engineering (Honours)", "BE(Hons)")
+      "Bachelor of Laws (LLB)"           → ("Bachelor of Laws", "LLB")
+
+    The abbreviation is identified as a trailing token that:
+      • Starts with 1–4 uppercase letters
+      • May have up to 4 lowercase letters (e.g. BSc, BCom, BEd)
+      • May be followed by a parenthesised suffix like (Hons)
+      • Is at the very end of the string (optionally inside outer parentheses)
+    """
+    heading = heading.strip()
+
+    # Pattern A: abbreviation wrapped in its own trailing parens, e.g. "(BE(Hons))" or "(BA)"
+    m = re.search(r'\s+\(([A-Z]{1,4}[a-z]{0,4}(?:\([A-Za-z]+\))?)\)\s*$', heading)
+    if m:
+        return heading[: m.start()].strip(), m.group(1)
+
+    # Pattern B: abbreviation as a bare trailing token, e.g. "... BE(Hons)" or "... BA"
+    m = re.search(r'\s+([A-Z]{1,4}[a-z]{0,4}(?:\([A-Za-z]+\))?)\s*$', heading)
+    if m:
+        return heading[: m.start()].strip(), m.group(1)
+
+    return heading, ""
+
+
 async def scrape_main_page(page: Page, prog: Programme) -> None:
-    # --- Name ---
+    """Extract name, description, duration, faculty from the main page."""
+
+    # --- Name + abbreviation (issue 5) ---
+    heading = ""
     for sel in ["h1.page-header__title", "h1"]:
+        heading = await _text(page, sel)
+        if heading:
+            break
+    prog.full_name, prog.short_name = _parse_name_and_abbreviation(heading)
+
+    # --- Description — skip breadcrumbs and bare faculty labels (issue 3) ---
+    desc = ""
+    for sel in [
+        "[class*='programme-overview'] p",
+        "[class*='overview'] p",
+        ".rich-text > p",
+        ".rich-text p",
+    ]:
         t = await _text(page, sel)
-        if t:
-            prog.full_name = t
+        if t and "Breadcrumbs" not in t and len(t) > 60:
+            desc = t
             break
 
-    # Strip abbreviation from name: "Bachelor of Foo (BFoo)" → name + short
-    if prog.full_name:
-        m = re.search(r"\(([A-Z][A-Za-z()/ ]{1,30})\)\s*$", prog.full_name)
-        if m:
-            prog.short_name = m.group(1).strip()
-            prog.full_name = prog.full_name[: m.start()].strip()
-
-    # --- Programme overview paragraph ---
-    # Try the "Programme overview" section first
-    desc = await _text(page, "[id*='overview'] p, [id*='Overview'] p")
     if not desc:
-        desc = await _text(page, ".rich-text p")
-    if not desc:
-        parts = await _texts(page, "main p")
-        desc = " ".join(parts[:3])
-    prog.description = desc
+        for p in await _texts(page, "main p"):
+            if "Breadcrumbs" in p:
+                continue
+            # Skip short strings that are just a faculty/school name
+            if len(p) < 60 and re.match(r'^[A-Z][A-Za-z\s&]+$', p):
+                continue
+            desc = p
+            break
 
-    # --- Duration, Points, Faculty from whole page text ---
-    body = await _page_text(page)
+    # Strip any "Breadcrumbs List." prefix that slipped through
+    desc = re.sub(r"^Breadcrumbs\s+List\.?\s*", "", desc, flags=re.I).strip()
+    prog.description = _clean(desc)
 
-    dur = re.search(r"(\d+(?:\.\d+)?)\s*years?\s*full[\s-]*time", body, re.I)
+    # --- Duration (issue 2) — page shows "Full-time: 3 years" ---
+    body = await _body_text(page)
+
+    dur = re.search(r"Full[\s-]*time[:\s]+(\d+(?:\.\d+)?)\s*years?", body, re.I)
     if not dur:
-        dur = re.search(r"Duration[:\s]+(\d+(?:\.\d+)?\s*years?)", body, re.I)
+        dur = re.search(r"Duration[:\s]+(\d+(?:\.\d+)?)\s*years?", body, re.I)
     if dur:
-        prog.duration = _clean(dur.group(0))
+        prog.duration = dur.group(1) + " years"
 
-    pts = re.search(r"(\d{2,3})\s*points", body, re.I)
-    if pts:
-        prog.points = pts.group(1)
-
+    # --- Faculty ---
     fac = re.search(
         r"(?:Faculty|School|Taught by)[:\s]+([A-Z][A-Za-z &,()]+?)(?:\s{2,}|\n|$)",
         body, re.I,
@@ -219,39 +312,39 @@ async def scrape_main_page(page: Page, prog: Programme) -> None:
 
 def _extract_rank_score(text: str) -> str:
     """
-    Pull NCEA rank score from the entry requirements text.
+    Extract the NCEA rank score from entry requirements text.
 
-    On UoA pages the rank score appears in a styled card:
-        Qualification → NCEA → Score required → 150
-    So we look for "Score required" near a 3-digit number first,
-    then fall back to broader patterns.
+    UoA pages show a card: Qualification → NCEA → Score required → <number>
+
+    We ONLY return a number when the "Score required" label is present nearby.
+    We do NOT fall back to any random number — if the label isn't found,
+    return '' rather than guess (issue 1).
     """
-    # Pattern 1: "Score required" followed by a number 100-320
-    m = re.search(r"Score\s*required[:\s]*(\d{2,3})", text, re.I)
+    # Pattern 1: "Score required" immediately followed by the number
+    m = re.search(r"Score\s+required[:\s]*(\d{2,3})", text, re.I)
     if m and 100 <= int(m.group(1)) <= 320:
         return m.group(1)
 
-    # Pattern 2: "NCEA" nearby then a standalone number 100-320
-    m = re.search(r"NCEA[^0-9]{0,80}?(\d{3})", text, re.I)
+    # Pattern 2: "NCEA" appears, then "Score required", then the number
+    # (handles multi-line card layout where they're on separate lines)
+    m = re.search(
+        r"NCEA.{0,150}Score\s+required[:\s]*(\d{2,3})",
+        text, re.I | re.S,
+    )
     if m and 100 <= int(m.group(1)) <= 320:
         return m.group(1)
 
-    # Pattern 3: "rank score" near a number
-    m = re.search(r"rank\s*score[^\d]{0,30}(\d{2,3})", text, re.I)
+    # Pattern 3: "rank score" label near a number
+    m = re.search(r"rank\s+score[^\d]{0,30}(\d{2,3})", text, re.I)
     if m and 100 <= int(m.group(1)) <= 320:
         return m.group(1)
 
-    # Pattern 4: any standalone 3-digit number in the 120-320 range
-    for m in re.finditer(r"\b(\d{3})\b", text):
-        v = int(m.group(1))
-        if 120 <= v <= 320:
-            return m.group(1)
-
+    # No labelled rank score found — leave blank (do NOT default to 120)
     return ""
 
 
 async def scrape_entry_requirements(page: Page, prog: Programme) -> None:
-    """Click Entry Requirements tab, wait TAB_WAIT, then scrape."""
+    """Click the Entry Requirements tab, wait TAB_WAIT, then scrape."""
     clicked = await _click_tab(
         page,
         "Entry requirements",
@@ -262,44 +355,29 @@ async def scrape_entry_requirements(page: Page, prog: Programme) -> None:
     if not clicked:
         return
 
-    # Fixed wait — no wait_for_selector
+    # Fixed wait — do NOT use wait_for_selector after tab click
     await asyncio.sleep(TAB_WAIT)
 
-    # --- Rank score: try targeted selectors first ---
-    for sel in [
-        ".score-required",
-        "[class*='score']",
-        "[class*='rank']",
-    ]:
-        t = await _text(page, sel)
-        if t:
-            m = re.search(r"(\d{2,3})", t)
-            if m and 100 <= int(m.group(1)) <= 320:
-                prog.ncea_rank_score = m.group(1)
-                break
+    # Use tab panel text only (issue 10) so other tabs' keywords can't bleed in
+    panel = await _tab_panel_text(page)
+    panel = re.sub(r"\s+", " ", panel)
 
-    # Fall back to full-text search of the visible tab content
-    panel = await _page_text(page)
-
-    if not prog.ncea_rank_score:
-        prog.ncea_rank_score = _extract_rank_score(panel)
+    # --- Rank score (issue 1) ---
+    prog.ncea_rank_score = _extract_rank_score(panel)
 
     # --- Required subjects at Level 3 ---
-    subj_matches = re.findall(
-        r"(?:NCEA\s*)?Level\s*3[^.;\n]{0,100}",
-        panel, re.I,
-    )
+    subj_matches = re.findall(r"(?:NCEA\s*)?Level\s*3[^.;\n]{0,100}", panel, re.I)
     if subj_matches:
         prog.required_subjects = "; ".join(_clean(s) for s in subj_matches[:8])
 
-    # --- Additional requirements (keywords) ---
+    # --- Additional requirements — only keywords explicitly on this page (issue 10) ---
     extras: list[str] = []
     for kw in [
         "UCAT", "portfolio", "audition", "interview",
         "entrance examination", "CASPer", "IELTS",
         "English proficiency", "health check",
     ]:
-        if kw.lower() in panel.lower():
+        if re.search(r"\b" + re.escape(kw) + r"\b", panel, re.I):
             extras.append(kw)
     if extras:
         prog.additional_requirements = ", ".join(extras)
@@ -309,8 +387,16 @@ async def scrape_entry_requirements(page: Page, prog: Programme) -> None:
 # 4. Fees & Scholarships tab
 # ---------------------------------------------------------------------------
 
+# Generic scholarship phrases to exclude (issue 8)
+_GENERIC_SCHOL_RE = re.compile(
+    r"Find\s+out|financial\s+support\s+information|"
+    r"^University\s+of\s+Auckland\s+Scholarship\s*$",
+    re.I,
+)
+
+
 async def scrape_fees_scholarships(page: Page, prog: Programme) -> None:
-    """Click Fees tab, wait TAB_WAIT, then scrape."""
+    """Click the Fees & Scholarships tab, wait TAB_WAIT, then scrape."""
     clicked = await _click_tab(
         page,
         "Fees and scholarships",
@@ -323,7 +409,7 @@ async def scrape_fees_scholarships(page: Page, prog: Programme) -> None:
 
     await asyncio.sleep(TAB_WAIT)
 
-    panel = await _page_text(page)
+    panel = await _tab_panel_text(page)
 
     # --- Domestic fees ---
     fee_m = re.search(
@@ -335,43 +421,56 @@ async def scrape_fees_scholarships(page: Page, prog: Programme) -> None:
     if fee_m:
         prog.domestic_fees = "$" + fee_m.group(1)
 
-    # --- Scholarships ---
-    schol = re.findall(
+    # --- Named scholarships only (issue 8) ---
+    raw_schols = re.findall(
         r"[A-Z][A-Za-z\s&']{5,60}(?:Scholarship|Award|Bursary|Prize)",
         panel,
     )
-    if schol:
-        prog.scholarships = "; ".join(_clean(s) for s in schol[:5])
+    named = []
+    seen_schols: set[str] = set()
+    for s in raw_schols:
+        s = _clean(s)
+        if s in seen_schols:
+            continue
+        seen_schols.add(s)
+        if not _GENERIC_SCHOL_RE.search(s):
+            named.append(s)
+    prog.scholarships = "; ".join(named[:5])
 
 
 # ---------------------------------------------------------------------------
-# 5. Per-programme orchestrator (with retries)
+# 5. Per-programme orchestrator
 # ---------------------------------------------------------------------------
 
 async def scrape_programme(page: Page, url: str) -> Optional[Programme]:
-    """Load one programme page, scrape all three sections. Retries on failure."""
+    """Scrape one programme page; retry up to MAX_RETRIES times on failure."""
     for attempt in range(1, MAX_RETRIES + 1):
         prog = Programme(url=url)
         try:
-            await page.goto(url, wait_until="domcontentloaded",
-                            timeout=MAX_TIMEOUT)
-            # Single wait to confirm the page rendered
+            await page.goto(url, wait_until="domcontentloaded", timeout=MAX_TIMEOUT)
+            # One wait to confirm the DOM is ready before any query_selector calls
             await page.wait_for_selector("h1, main", timeout=MAX_TIMEOUT)
 
             await scrape_main_page(page, prog)
+
+            # Issue 9: skip index page or misloaded pages
+            if not prog.full_name or prog.full_name.lower() == "find a study option":
+                log.warning("  Skipping non-programme page: %s", url)
+                return None
+
             await scrape_entry_requirements(page, prog)
             await scrape_fees_scholarships(page, prog)
             return prog
 
         except (PlaywrightTimeout, asyncio.TimeoutError):
-            log.warning("  Timeout (attempt %d/%d) %s", attempt, MAX_RETRIES, url)
+            log.warning("  Timeout (attempt %d/%d): %s", attempt, MAX_RETRIES, url)
         except Exception as e:
             log.warning("  Error (attempt %d/%d) %s: %s", attempt, MAX_RETRIES, url, e)
 
         if attempt < MAX_RETRIES:
             await asyncio.sleep(1)
 
-    log.error("  GAVE UP on %s after %d attempts", url, MAX_RETRIES)
+    log.error("  GAVE UP after %d attempts: %s", MAX_RETRIES, url)
     return None
 
 
@@ -380,7 +479,7 @@ async def scrape_programme(page: Page, url: str) -> Optional[Programme]:
 # ---------------------------------------------------------------------------
 
 def _open_csv(path: str):
-    """Delete any existing file, open fresh, write header. Return (file, writer)."""
+    """Delete existing file, open fresh, write header. Return (file, writer)."""
     Path(path).unlink(missing_ok=True)
     fieldnames = list(asdict(Programme()).keys())
     f = open(path, "w", newline="", encoding="utf-8")
@@ -402,12 +501,12 @@ def _append_row(writer, f, prog: Programme) -> None:
 
 async def main() -> None:
     csv_file, csv_writer = _open_csv(OUTPUT_CSV)
-    log.info("Fresh %s created for incremental writing", OUTPUT_CSV)
+    log.info("Fresh %s opened for incremental writing", OUTPUT_CSV)
     count = 0
 
     try:
         async with async_playwright() as pw:
-            # Prefer a pre-cached Chromium if the expected version is missing
+            # Use pre-cached Chromium if the expected version isn't downloaded
             chrome_path = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "")
             if not chrome_path:
                 for candidate in [
@@ -421,7 +520,7 @@ async def main() -> None:
 
             launch_kw: dict = {"headless": True}
             if chrome_path:
-                log.info("Using Chromium at: %s", chrome_path)
+                log.info("Using Chromium: %s", chrome_path)
                 launch_kw["executable_path"] = chrome_path
 
             browser = await pw.chromium.launch(**launch_kw)
@@ -435,14 +534,12 @@ async def main() -> None:
             )
             page = await context.new_page()
 
-            # ---- discover links ----
             links = await get_programme_links(page)
             if not links:
                 log.error("No programme links found — check the index page.")
                 await browser.close()
                 return
 
-            # ---- scrape each programme ----
             for i, url in enumerate(links, 1):
                 log.info("[%d/%d] %s", i, len(links), url)
 
