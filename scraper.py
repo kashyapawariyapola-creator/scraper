@@ -150,22 +150,33 @@ async def _click_tab(page: Page, *labels: str) -> bool:
 # URL filtering (issues 6 & 7)
 # ---------------------------------------------------------------------------
 
+# URLs that must never be filtered out even if they trip a conjoint heuristic.
+# MBChB literally contains "bachelor" twice but is a single integrated degree.
+_ALWAYS_INCLUDE = [
+    "medicine-and-bachelor-of-surgery",  # MBChB
+]
+
+
 def _should_skip_url(url: str) -> tuple[bool, str]:
     """
     Return (True, reason) if the URL should be excluded, otherwise (False, '').
 
     Conjoint detection only triggers on:
       1. The word "conjoint" explicitly in the slug.
-      2. "bachelor" appearing more than once (e.g. bachelor-commerce-bachelor-design).
+      2. "bachelor" appearing more than once — EXCEPT for URLs in _ALWAYS_INCLUDE.
       3. A known pairing of two distinct degree subjects in the same slug
          (tight list — avoids false positives on degrees like fine-arts-design).
 
-    Honours filter is intentionally absent: integrated honours programmes like
-    BE(Hons), Advanced Science (Honours), Music (Honours) are valid undergrad
-    degrees and cannot be reliably distinguished from postgrad extensions by URL
-    alone.
+    Honours filter is intentionally absent: integrated honours programmes
+    (Medical Imaging, Medical Science, Social Work, Urban Planning, Pharmacy,
+    Nursing, Science, etc.) are valid undergrad degrees and cannot be reliably
+    distinguished from postgrad extensions by URL alone.
     """
     slug = url.lower().rstrip("/").split("/")[-1].replace(".html", "")
+
+    # Always-include exceptions checked before any heuristic
+    if any(exc in slug for exc in _ALWAYS_INCLUDE):
+        return False, ""
 
     if "conjoint" in slug:
         return True, "contains 'conjoint'"
