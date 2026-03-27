@@ -39,10 +39,12 @@ MAX_TIMEOUT = 8000      # ms — hard cap for every Playwright timeout
 TAB_WAIT = 1.5          # seconds to sleep after clicking a tab (then proceed regardless)
 MAX_RETRIES = 3         # page-level retries on error/timeout
 
-# Degree-subject keywords used to detect conjoint URLs (issue 6)
-_SUBJECTS = [
-    "arts", "commerce", "science", "engineering",
-    "design", "education", "music", "laws",
+# Known conjoint pairings — both subjects appearing in the same slug = conjoint degree.
+# Keep this list tight: only pairs where BOTH words unambiguously name a separate degree.
+_CONJOINT_PAIRS: list[tuple[str, str]] = [
+    ("arts", "laws"),       # BA/LLB
+    ("commerce", "laws"),   # BCom/LLB
+    ("engineering", "science"),  # BE/BSc
 ]
 
 
@@ -148,27 +150,34 @@ async def _click_tab(page: Page, *labels: str) -> bool:
 # URL filtering (issues 6 & 7)
 # ---------------------------------------------------------------------------
 
-def _should_skip_url(url: str) -> bool:
+def _should_skip_url(url: str) -> tuple[bool, str]:
     """
-    Return True for URLs that should be excluded:
-      - Conjoint / double-degree URLs (issue 6)
-      - Postgraduate honours extensions, keeping only engineering & laws (issue 7)
+    Return (True, reason) if the URL should be excluded, otherwise (False, '').
+
+    Conjoint detection only triggers on:
+      1. The word "conjoint" explicitly in the slug.
+      2. "bachelor" appearing more than once (e.g. bachelor-commerce-bachelor-design).
+      3. A known pairing of two distinct degree subjects in the same slug
+         (tight list — avoids false positives on degrees like fine-arts-design).
+
+    Honours filter is intentionally absent: integrated honours programmes like
+    BE(Hons), Advanced Science (Honours), Music (Honours) are valid undergrad
+    degrees and cannot be reliably distinguished from postgrad extensions by URL
+    alone.
     """
     slug = url.lower().rstrip("/").split("/")[-1].replace(".html", "")
 
-    # Issue 6: conjoint / double-degree
     if "conjoint" in slug:
-        return True
+        return True, "contains 'conjoint'"
+
     if slug.count("bachelor") > 1:
-        return True
-    if sum(1 for s in _SUBJECTS if s in slug) > 1:
-        return True
+        return True, f"'bachelor' appears {slug.count('bachelor')}x"
 
-    # Issue 7: postgrad honours — only keep engineering and laws honours
-    if "honours" in slug and "engineering" not in slug and "laws" not in slug:
-        return True
+    for a, b in _CONJOINT_PAIRS:
+        if a in slug and b in slug:
+            return True, f"conjoint pair ({a} + {b})"
 
-    return False
+    return False, ""
 
 
 # ---------------------------------------------------------------------------
@@ -200,17 +209,30 @@ async def get_programme_links(page: Page) -> list[str]:
 
     seen: set[str] = set()
     unique: list[str] = []
+    skipped: list[tuple[str, str]] = []
+
     for link in all_links:
         clean = link.split("?")[0].split("#")[0]
-        if (
-            clean not in seen
-            and "bachelor" in clean.lower()
-            and not _should_skip_url(clean)
-        ):
-            seen.add(clean)
+        if clean in seen:
+            continue
+        seen.add(clean)
+
+        if "bachelor" not in clean.lower():
+            continue  # silently drop non-bachelor links
+
+        skip, reason = _should_skip_url(clean)
+        if skip:
+            skipped.append((clean, reason))
+        else:
             unique.append(clean)
 
     log.info("Found %d bachelor programme links (after filtering)", len(unique))
+    if skipped:
+        log.info("--- SKIPPED %d URLs ---", len(skipped))
+        for url, reason in skipped:
+            log.info("  SKIP (%s): %s", reason, url)
+        log.info("--- END SKIPPED ---")
+
     return unique
 
 
